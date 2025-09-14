@@ -18,13 +18,19 @@ if (!$body || empty($body['imageBase64']) || strlen($body['imageBase64']) < 100)
 }
 
 $apiKey  = getenv('MINDEE_API_KEY') ?: '';
-$modelId = getenv('MINDEE_MODEL_ID') ?: '';  // <<<<<< IMPORTANT
+$modelId = getenv('MINDEE_MODEL_ID') ?: '';
 if (!$apiKey || !$modelId) {
   http_response_code(500);
   echo json_encode(['error'=>'MINDEE_API_KEY or MINDEE_MODEL_ID not set']); exit;
 }
 
-// ---------- helpers ----------
+require __DIR__ . '/vendor/autoload.php';
+
+use Mindee\ClientV2;
+use Mindee\Input\PathInput;
+use Mindee\Input\InferenceParameters;
+
+// ------- helpers -------
 function toNum($s){ if($s===null||$s==='')return null; $n=floatval(str_replace([' ', ','], ['', '.'], (string)$s)); return is_finite($n)?round($n,2):null; }
 function toISO($s){
   if(!$s) return null; $s=trim((string)$s);
@@ -41,26 +47,30 @@ function firstText($v){
   return $v;
 }
 
-require __DIR__ . '/vendor/autoload.php';
-
-use Mindee\ClientV2;
-use Mindee\Input\Base64Input;
-use Mindee\Input\InferenceParameters;
-
 try {
-  // Client V2 + modelId (fourni par ta page “API docs” du modèle)
+  // 1) Écrire l'image base64 dans un fichier temporaire
+  $tmp = tempnam(sys_get_temp_dir(), 'rcpt_');
+  // Essayons d'inférer une extension JPEG pour éviter quelques parsers tatillons
+  $tmpJpg = $tmp . '.jpg';
+  file_put_contents($tmpJpg, base64_decode($body['imageBase64']));
+
+  // 2) Client V2 + modelId
   $client = new ClientV2($apiKey);
   $params = new InferenceParameters($modelId);
 
-  $dataUri = 'data:image/jpeg;base64,' . $body['imageBase64'];
-  $input   = Base64Input::fromString($dataUri);
+  // 3) Input via PathInput (compat 100%)
+  $input  = new PathInput($tmpJpg);
 
+  // 4) Lancer l'inférence
   $response = $client->enqueueAndGetInference($input, $params);
 
-  // Selon la version, la forme est: $response->inference->prediction
+  // (nettoyage fichier temp)
+  @unlink($tmpJpg);
+  @unlink($tmp);
+
+  // 5) Extraire les champs
   $pred = $response->inference->prediction ?? [];
 
-  // Champs possibles (diffèrent un peu selon versions)
   $supplier = firstText($pred['supplier_name'] ?? null)
            ?: firstText($pred['merchant_name'] ?? null) ?: '';
   $dateRaw  = firstText($pred['date'] ?? null)
@@ -72,12 +82,10 @@ try {
     'supplier' => $supplier,
     'dateISO'  => toISO($dateRaw),
     'total'    => toNum($totalRaw),
-    // 'debug' => $response, // décommenter au besoin
   ]);
   exit;
 
 } catch (\Throwable $e) {
-  // Pour diagnostiquer si ça casse avant d’appeler Mindee (clé/modelId manquants, etc.)
   http_response_code(502);
   echo json_encode(['error'=>'SDK error', 'message'=>$e->getMessage()]);
   exit;
