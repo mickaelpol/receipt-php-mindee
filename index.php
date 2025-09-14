@@ -81,16 +81,13 @@ function uniqueKeepOrder(array $arr){
   }
   return $out;
 }
-// renvoie le texte d'un node Mindee possible
 function firstText($v){
   if (is_array($v)) { $v0 = $v[0] ?? null; if (is_array($v0)) return $v0['content'] ?? $v0['text'] ?? $v0['value'] ?? null; return $v0; }
   if (is_object($v)) return $v->content ?? $v->text ?? $v->value ?? null;
   return $v;
 }
-// détecte "ça ressemble à un nom de fichier"
 function isFilenameLike(string $s): bool {
-  $s = trim($s);
-  if ($s === '') return false;
+  $s = trim($s); if ($s === '') return false;
   if (preg_match('/\.(jpg|jpeg|png|pdf|tif|tiff)$/i', $s)) return true;
   if (preg_match('#[\\\\/]+#', $s)) return true;
   if (preg_match('/^(img|pXL|dsc|rcpt|scan)[_\-]?\d+/i', $s)) return true;
@@ -107,15 +104,52 @@ function pickSupplierFromList(array $cands): ?string {
   return null;
 }
 
-// Score “intelligent” pour les montants (favorise total à payer, pénalise réservations)
+/* ==== scoring et sélection des montants ==== */
+function classifyContext(string $path, string $ctx): array {
+  $p = strtolower($path); $c = strtolower($ctx);
+  $isReserve = preg_match('/reservat|reserva|pre.?aut|pre.?autor|preauth|pre.?authorization|cauci[oó]n|dep[oó]sito|bloqueo|reservation/', $p.$c);
+  $isSupply  = preg_match('/suminist|suministro|combustible|fuel/', $p.$c);
+  $isToPay   = preg_match('/a\s*pagar|à\s*payer|importe\s+total|total\s*cb|total\s*ttc|ttc|paid|payment|to\s*pay|net\s*(?:to|à)?\s*payer/', $p.$c);
+  $isGeneric = preg_match('/total|amount|sum|grand|ttc|pay/', $p);
+  return [
+    'reserve' => (bool)$isReserve,
+    'supply'  => (bool)$isSupply,
+    'toPay'   => (bool)$isToPay,
+    'generic' => (bool)$isGeneric,
+  ];
+}
 function scoreAmountCandidate(float $n, string $path, string $ctx): int {
+  $flags = classifyContext($path, $ctx);
   $s = 0;
-  $good = '/a\s*pagar|à\s*payer|pagado|importe\s+total|total\s*cb|total\s*ttc|ttc|paid|payment|to\s*pay|net\s*(?:to|à)?\s*payer|suminist|suministro/i';
-  $bad  = '/reservat|reserva|pre.?aut|pre.?autor|preauth|pre.?authorization|cauci[oó]n|dep[oó]sito|bloqueo|reservation/i';
-  if (preg_match($good, $ctx) || preg_match($good, $path)) $s += 5;
-  if (preg_match($bad,  $ctx) || preg_match($bad,  $path)) $s -= 6;
-  if (preg_match('/total|amount|sum|grand|ttc|pay/i', $path)) $s += 1;
+  if ($flags['supply'])  $s += 8;    // carburant → très prioritaire
+  if ($flags['toPay'])   $s += 6;    // total à payer / payé
+  if ($flags['generic']) $s += 1;    // “total/amount/sum” dans le chemin
+  if ($flags['reserve']) $s -= 10;   // réservations fortement pénalisées
   return $s;
+}
+function pickBestTotal(array $cands): ?float {
+  if (empty($cands)) return null;
+
+  // Séparer par catégories
+  $prefSupply = array_filter($cands, fn($a) => !$a['reserve'] && $a['supply']);
+  $prefPay    = array_filter($cands, fn($a) => !$a['reserve'] && $a['toPay']);
+  $nonReserve = array_filter($cands, fn($a) => !$a['reserve']);
+
+  // Helper tri: score desc, puis préfère non-.00, puis plus grand
+  $cmp = function($a, $b){
+    if ($a['score'] !== $b['score']) return $b['score'] <=> $a['score'];
+    $a00 = fmod($a['num'], 1.0) === 0.0;
+    $b00 = fmod($b['num'], 1.0) === 0.0;
+    if ($a00 !== $b00) return $a00 <=> $b00; // 0.68 avant 0.00
+    return $b['num'] <=> $a['num'];
+  };
+
+  if (!empty($prefSupply)) { usort($prefSupply, $cmp); return $prefSupply[0]['num']; }
+  if (!empty($prefPay))    { usort($prefPay,    $cmp); return $prefPay[0]['num']; }
+  if (!empty($nonReserve)) { usort($nonReserve, $cmp); return $nonReserve[0]['num']; }
+
+  usort($cands, $cmp);
+  return $cands[0]['num'];
 }
 
 /* ======================
@@ -134,9 +168,6 @@ try {
   // 3) Input via PathInput (évite les soucis de versions de SDK)
   $input     = new PathInput($tmpJpg);
   $response  = $client->enqueueAndGetInference($input, $params);
-
-  // (facultatif) pour diagnostiquer la forme exacte de la réponse :
-  // error_log("MINDEE RAW: " . print_r($response, true));
 
   // Nettoyage des temporaires
   @unlink($tmpJpg);
@@ -169,78 +200,63 @@ try {
   }
   $supplier = pickSupplierFromList($supplierCandidates) ?? '';
 
-  // ----- DATES & TOTAL (pondération) -----
+  // ----- DATES -----
   $dates   = [];
-  $amounts = []; // tableau de candidats: ['num'=>float,'path'=>string,'ctx'=>string,'score'=>int]
+  foreach ($flat as $path => $val) {
+    if ($val === null || $val === '') continue;
+    if (is_string($val) && preg_match('/\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})\b/', $val, $m)) {
+      $dates[] = $m[1];
+    }
+  }
+  $dates = uniqueKeepOrder($dates);
+  $dateISO = null;
+  foreach ($dates as $d) { $dt = toISO($d); if ($dt) { $dateISO = $dt; break; } }
 
+  // ----- TOTAL (catégorisé & pondéré) -----
+  $amountCands = []; // ['num','path','ctx','score','reserve','supply','toPay','generic']
   foreach ($flat as $path => $val) {
     if ($val === null || $val === '') continue;
 
-    // dates
-    if (is_string($val)) {
-      if (preg_match('/\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})\b/', $val, $m)) {
-        $dates[] = $m[1];
-      }
-    }
-
-    // montants (string)
     if (is_string($val)) {
       if (preg_match_all('/(\d[\d\s]{0,3}(?:\s?\d{3})*[.,]\d{2})\b/', $val, $mm)) {
         foreach ($mm[1] as $found) {
           $n = toNum($found);
-          if ($n !== null && $n > 0) {
-            $amounts[] = [
-              'num'   => $n,
-              'path'  => (string)$path,
-              'ctx'   => (string)$val,
-              'score' => scoreAmountCandidate($n, (string)$path, (string)$val),
+          if ($n !== null && $n > 0.2 && $n < 20000) {
+            $flags = classifyContext((string)$path, (string)$val);
+            $amountCands[] = [
+              'num'     => $n,
+              'path'    => (string)$path,
+              'ctx'     => (string)$val,
+              'score'   => scoreAmountCandidate($n, (string)$path, (string)$val),
+              'reserve' => $flags['reserve'],
+              'supply'  => $flags['supply'],
+              'toPay'   => $flags['toPay'],
+              'generic' => $flags['generic'],
             ];
           }
         }
       }
-    }
-    // montants numériques sous clés total/amount/sum…
-    elseif (is_numeric($val)) {
+    } elseif (is_numeric($val)) {
       if (preg_match('/total|amount|sum|grand/i', $path)) {
         $n = toNum($val);
-        if ($n !== null && $n > 0) {
-          $amounts[] = [
-            'num'   => $n,
-            'path'  => (string)$path,
-            'ctx'   => (string)$val,
-            'score' => scoreAmountCandidate($n, (string)$path, (string)$val),
+        if ($n !== null && $n > 0.2 && $n < 20000) {
+          $flags = classifyContext((string)$path, (string)$val);
+          $amountCands[] = [
+            'num'     => $n,
+            'path'    => (string)$path,
+            'ctx'     => (string)$val,
+            'score'   => scoreAmountCandidate($n, (string)$path, (string)$val),
+            'reserve' => $flags['reserve'],
+            'supply'  => $flags['supply'],
+            'toPay'   => $flags['toPay'],
+            'generic' => $flags['generic'],
           ];
         }
       }
     }
   }
 
-  $dates = uniqueKeepOrder($dates);
-
-  // Choix de la date
-  $dateISO = null;
-  foreach ($dates as $d) { $dt = toISO($d); if ($dt) { $dateISO = $dt; break; } }
-
-  // Sélection du total avec pondération
-  $total = null;
-  if (!empty($amounts)) {
-    // éliminer les très “mauvais” si on a d'autres options
-    $nonBad = array_filter($amounts, fn($a) => $a['score'] > -3);
-    $pool   = !empty($nonBad) ? $nonBad : $amounts;
-
-    // tri par score desc, puis en cas d’égalité on préfère celui qui n’est pas .00
-    usort($pool, function($a, $b){
-      if ($a['score'] !== $b['score']) return $b['score'] <=> $a['score'];
-      $a00 = fmod($a['num'], 1.0) === 0.0;
-      $b00 = fmod($b['num'], 1.0) === 0.0;
-      if ($a00 !== $b00) return $a00 <=> $b00; // false(=0.68) < true(=99.00) → 0.68 priorisé
-      return $b['num'] <=> $a['num']; // sinon plus grand
-    });
-
-    $best = $pool[0];
-    $total = $best['num'];
-    // (debug) error_log("TOTAL CANDS: " . print_r($pool, true));
-  }
+  $total = pickBestTotal($amountCands);
 
   echo json_encode([
     'supplier' => $supplier,
