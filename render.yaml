@@ -7,4 +7,4 @@ services:
     dockerfilePath: ./Dockerfile
     envVars:
       - key: MINDEE_API_KEY
-        sync: false   # tu la saisis dans Render UI
+        sync: false
