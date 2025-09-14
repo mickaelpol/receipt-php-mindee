@@ -81,6 +81,35 @@ function uniqueKeepOrder(array $arr){
   }
   return $out;
 }
+// renvoie le texte d'un node Mindee possible
+function firstText($v){
+  if (is_array($v)) { $v0 = $v[0] ?? null; if (is_array($v0)) return $v0['content'] ?? $v0['text'] ?? $v0['value'] ?? null; return $v0; }
+  if (is_object($v)) return $v->content ?? $v->text ?? $v->value ?? null;
+  return $v;
+}
+// détecte "ça ressemble à un nom de fichier"
+function isFilenameLike(string $s): bool {
+  $s = trim($s);
+  if ($s === '') return false;
+  // extensions fréquentes ou présence de slash
+  if (preg_match('/\.(jpg|jpeg|png|pdf|tif|tiff)$/i', $s)) return true;
+  if (preg_match('#[\\\\/]+#', $s)) return true;
+  // patterns classiques d'appareil photo
+  if (preg_match('/^(img|pXL|dsc|rcpt|scan)[_\-]?\d+/i', $s)) return true;
+  // trop numérique / id technique
+  if (preg_match('/^[a-z0-9_\-]+\.(?:tmp|dat)$/i', $s)) return true;
+  return false;
+}
+// pick premier texte non vide qui n'est pas un filename
+function pickSupplierFromList(array $cands): ?string {
+  foreach ($cands as $c) {
+    $t = trim((string)$c);
+    if ($t !== '' && mb_strlen($t) >= 2 && !preg_match('/^\d+$/', $t) && !isFilenameLike($t)) {
+      return $t;
+    }
+  }
+  return null;
+}
 
 /* ======================
    Main
@@ -110,38 +139,54 @@ try {
   $arr  = json_decode(json_encode($response), true);
   $flat = flattenAssoc($arr);
 
-  $suppliers = [];
-  $dates     = [];
-  $amounts   = [];
+  // ----- SUPPLIER (priorité aux champs "propres") -----
+  $pred = $arr['inference']['prediction'] ?? ($arr['document']['inference']['prediction'] ?? null);
+
+  $supplierCandidates = [];
+  if (is_array($pred)) {
+    $supplierCandidates[] = firstText($pred['supplier_name'] ?? null);
+    $supplierCandidates[] = firstText($pred['merchant_name'] ?? null);
+    $supplierCandidates[] = firstText($pred['company_name'] ?? null);
+    $supplierCandidates[] = firstText($pred['store_name'] ?? null);
+    $supplierCandidates[] = firstText($pred['retailer_name'] ?? null);
+    $supplierCandidates[] = firstText($pred['supplier'] ?? null);
+    $supplierCandidates[] = firstText($pred['merchant'] ?? null);
+    $supplierCandidates = array_filter($supplierCandidates, fn($x) => $x !== null && $x !== '');
+  }
+
+  // si rien via prediction, scanner le flatten mais en évitant les filename
+  if (empty($supplierCandidates)) {
+    foreach ($flat as $path => $val) {
+      if ($val === null || $val === '') continue;
+      if (!preg_match('/supplier|merchant|store|vendor|company|retailer|name/i', $path)) continue;
+      if (is_string($val) && !isFilenameLike($val)) $supplierCandidates[] = $val;
+    }
+  }
+
+  $supplier = pickSupplierFromList($supplierCandidates) ?? '';
+
+  // ----- DATES & TOTAL (heuristique comme avant) -----
+  $dates   = [];
+  $amounts = [];
 
   foreach ($flat as $path => $val) {
     if ($val === null || $val === '') continue;
 
-    // Nom d'enseigne (supplier/merchant/store/company/vendor/retailer/name…)
-    if (preg_match('/supplier|merchant|store|vendor|company|retailer|name/i', $path)) {
-      if (is_string($val)) {
-        $txt = trim($val);
-        if (mb_strlen($txt) >= 3 && !preg_match('/^\d+$/', $txt)) {
-          $suppliers[] = $txt;
-        }
-      }
-    }
-
-    // Dates (ISO ou jj/mm/aaaa)
+    // dates
     if (is_string($val)) {
       if (preg_match('/\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})\b/', $val, $m)) {
         $dates[] = $m[1];
       }
     }
 
-    // Montants (string avec décimales)
+    // montants (string)
     if (is_string($val)) {
       if (preg_match('/(\d[\d\s]{0,3}(?:\s?\d{3})*[.,]\d{2})\b/', $val, $m)) {
         $n = toNum($m[1]);
         if ($n !== null && $n > 0) $amounts[] = $n;
       }
     }
-    // Montants numériques sous clés total/amount/sum…
+    // montants numériques sous clés total/amount/sum…
     elseif (is_numeric($val)) {
       if (preg_match('/total|amount|sum|grand/i', $path)) {
         $n = toNum($val);
@@ -150,15 +195,10 @@ try {
     }
   }
 
-  // Dédupliquer
-  $suppliers = uniqueKeepOrder($suppliers);
-  $dates     = uniqueKeepOrder($dates);
-  $amounts   = uniqueKeepOrder($amounts);
+  $dates   = uniqueKeepOrder($dates);
+  $amounts = uniqueKeepOrder($amounts);
 
-  // Choix final
-  $supplier = $suppliers[0] ?? '';
-
-  $dateISO  = null;
+  $dateISO = null;
   foreach ($dates as $d) { $dt = toISO($d); if ($dt) { $dateISO = $dt; break; } }
 
   $total = null;
@@ -167,11 +207,10 @@ try {
     if (!empty($plausible)) $total = max($plausible);
   }
 
-  // (fallbacks directs si ton modèle expose des clés “propres”)
-  // $pred     = $arr['inference']['prediction'] ?? $arr['document']['inference']['prediction'] ?? [];
-  // $supplier = $supplier ?: ($pred['supplier_name']['value'] ?? $pred['merchant_name']['value'] ?? '');
-  // $dateISO  = $dateISO  ?: toISO($pred['date']['value'] ?? $pred['purchase_date']['value'] ?? null);
-  // $total    = $total    ?: toNum($pred['total_amount']['value'] ?? $pred['amount_total']['value'] ?? null);
+  // (fallback directs possibles si ton modèle expose des clés “propres”)
+  // $supplier = $supplier ?: firstText($pred['supplier_name'] ?? $pred['merchant_name'] ?? $pred['company_name'] ?? null);
+  // $dateISO  = $dateISO  ?: toISO(firstText($pred['date'] ?? $pred['purchase_date'] ?? null));
+  // $total    = $total    ?: toNum(firstText($pred['total_amount'] ?? $pred['amount_total'] ?? null));
 
   echo json_encode([
     'supplier' => $supplier,
