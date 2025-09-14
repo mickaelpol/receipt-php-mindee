@@ -49,6 +49,16 @@ function toISO($s){
   }
   return null;
 }
+function flattenAssoc(array $a, string $prefix=''): array {
+  $out=[];
+  foreach ($a as $k=>$v){
+    $path = $prefix==='' ? (string)$k : $prefix.'.'.$k;
+    if (is_array($v)) $out += flattenAssoc($v,$path);
+    else $out[$path] = $v;
+  }
+  return $out;
+}
+function uniqueKeepOrder(array $arr){ $seen=[]; $out=[]; foreach($arr as $x){ $k=md5((string)$x); if(isset($seen[$k])) continue; $seen[$k]=1; $out[]=$x; } return $out; }
 function firstText($v){
   if (is_array($v)) { $v0 = $v[0] ?? null; if (is_array($v0)) return $v0['content'] ?? $v0['text'] ?? $v0['value'] ?? null; return $v0; }
   if (is_object($v)) return $v->content ?? $v->text ?? $v->value ?? null;
@@ -56,43 +66,86 @@ function firstText($v){
 }
 
 try {
-  // 1) Écrire l'image base64 dans un fichier temporaire
-  $tmp = tempnam(sys_get_temp_dir(), 'rcpt_');
-  // Essayons d'inférer une extension JPEG pour éviter quelques parsers tatillons
-  $tmpJpg = $tmp . '.jpg';
-  file_put_contents($tmpJpg, base64_decode($body['imageBase64']));
+  function uniqueKeepOrder(array $arr){ $seen=[]; $out=[]; foreach($arr as $x){ $k=md5((string)$x); if(isset($seen[$k])) continue; $seen[$k]=1; $out[]=$x; } return $out; }
 
-  // 2) Client V2 + modelId
-  $client = new ClientV2($apiKey);
-  $params = new InferenceParameters($modelId);
+// convertir l'objet réponse en tableau associatif
+$arr   = json_decode(json_encode($response), true);
+$flat  = flattenAssoc($arr);
 
-  // 3) Input via PathInput (compat 100%)
-  $input  = new PathInput($tmpJpg);
+// candidates
+$suppliers = [];
+$dates     = [];
+$amounts   = [];
 
-  // 4) Lancer l'inférence
-  $response = $client->enqueueAndGetInference($input, $params);
-  error_log("MINDEE RAW: " . print_r($response, true));
+// heuristique : on scanne toutes les clés/valeurs
+foreach ($flat as $path => $val) {
+  if ($val === null || $val === '') continue;
 
-  // (nettoyage fichier temp)
-  @unlink($tmpJpg);
-  @unlink($tmp);
+  // supplier / merchant / company / store …
+  if (preg_match('/supplier|merchant|store|vendor|company|retailer|name/i', $path)) {
+    if (is_string($val)) {
+      $txt = trim($val);
+      if (mb_strlen($txt) >= 3 && !preg_match('/^\d+$/', $txt)) {
+        $suppliers[] = $txt;
+      }
+    }
+  }
 
-  // 5) Extraire les champs
-  $pred = $response->inference->prediction ?? [];
+  // dates : 2025-08-07 ou 07/08/2025 etc.
+  if (is_string($val)) {
+    if (preg_match('/\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})\b/', $val, $m)) {
+      $dates[] = $m[1];
+    }
+  }
 
-  $supplier = firstText($pred['supplier_name'] ?? null)
-           ?: firstText($pred['merchant_name'] ?? null) ?: '';
-  $dateRaw  = firstText($pred['date'] ?? null)
-           ?: firstText($pred['purchase_date'] ?? null) ?: null;
-  $totalRaw = firstText($pred['total_amount'] ?? null)
-           ?: firstText($pred['amount_total'] ?? null) ?: null;
+  // montants : nombre avec décimales, ou numérique sous clés "total"/"amount"
+  if (is_string($val)) {
+    if (preg_match('/(\d[\d\s]{0,3}(?:\s?\d{3})*[.,]\d{2})\b/', $val, $m)) {
+      $n = toNum($m[1]);
+      if ($n !== null && $n > 0) $amounts[] = $n;
+    }
+  } elseif (is_numeric($val)) {
+    if (preg_match('/total|amount|sum|grand/i', $path)) {
+      $n = toNum($val);
+      if ($n !== null && $n > 0) $amounts[] = $n;
+    }
+  }
+}
 
-  echo json_encode([
-    'supplier' => $supplier,
-    'dateISO'  => toISO($dateRaw),
-    'total'    => toNum($totalRaw),
-  ]);
-  exit;
+// dédoublonner
+$suppliers = uniqueKeepOrder($suppliers);
+$dates     = uniqueKeepOrder($dates);
+$amounts   = uniqueKeepOrder($amounts);
+
+// choisir les meilleurs candidats
+$supplier = $suppliers[0] ?? '';
+
+// date : première date valable
+$dateISO  = null;
+foreach ($dates as $d) { $dt = toISO($d); if ($dt) { $dateISO = $dt; break; } }
+
+// total : on prend le plus grand plausible (souvent "total à payer")
+$total    = null;
+if (!empty($amounts)) {
+  // bornes de sécurité pour éviter des numéros de carte capturés par erreur
+  $plausible = array_values(array_filter($amounts, fn($x) => $x > 0.2 && $x < 20000));
+  if (!empty($plausible)) $total = max($plausible);
+}
+
+// fallback : si tu veux tenter les clés "directes" d'abord (si ton modèle les expose)
+// (décommente si besoin)
+// $pred = $arr['inference']['prediction'] ?? $arr['document']['inference']['prediction'] ?? [];
+// $supplier = $supplier ?: ($pred['supplier_name']['value'] ?? $pred['merchant_name']['value'] ?? '');
+// $dateISO  = $dateISO  ?: toISO($pred['date']['value'] ?? $pred['purchase_date']['value'] ?? null);
+// $total    = $total    ?: toNum($pred['total_amount']['value'] ?? $pred['amount_total']['value'] ?? null);
+
+// retourner au client
+echo json_encode([
+  'supplier' => $supplier,
+  'dateISO'  => $dateISO,
+  'total'    => $total
+]);
+exit;
 
 } catch (\Throwable $e) {
   http_response_code(502);
