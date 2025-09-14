@@ -2,45 +2,43 @@
 /** -------------------------------------------------------------
  *  Receipt Parser API (Render)
  *  POST { imageBase64 }  -> { supplier, dateISO, total }
- *  -------------------------------------------------------------
- */
+ *  ------------------------------------------------------------- */
 
-// --- garder la réponse JSON propre (pas d’avertissements à l’écran)
 if (function_exists('ini_set')) {
   ini_set('display_errors', '0');
-  ini_set('log_errors', '1'); // les erreurs iront dans les logs Render
+  ini_set('log_errors', '1');
 }
 error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE & ~E_WARNING);
 header('Content-Type: application/json');
 
-// --- CORS
+// CORS
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Headers: Content-Type');
 header('Access-Control-Allow-Methods: POST, GET, OPTIONS');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit; }
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
-  if (($_SERVER['REQUEST_URI'] ?? '/') === '/ping') { echo json_encode(['ok' => true]); exit; }
-  http_response_code(405); echo json_encode(['error' => 'Use POST']); exit;
+  if (($_SERVER['REQUEST_URI'] ?? '/') === '/ping') { echo json_encode(['ok'=>true]); exit; }
+  http_response_code(405); echo json_encode(['error'=>'Use POST']); exit;
 }
 
-// --- payload
+// Payload
 $raw  = file_get_contents('php://input');
 $body = json_decode($raw, true);
 if (!$body || empty($body['imageBase64']) || strlen($body['imageBase64']) < 100) {
-  http_response_code(400); echo json_encode(['error' => 'imageBase64 required']); exit;
+  http_response_code(400); echo json_encode(['error'=>'imageBase64 required']); exit;
 }
 
-// --- env vars
+// Env vars
 $apiKey  = getenv('MINDEE_API_KEY') ?: '';
 $modelId = getenv('MINDEE_MODEL_ID') ?: '';
 if (!$apiKey || !$modelId) {
   http_response_code(500);
-  echo json_encode(['error' => 'MINDEE_API_KEY or MINDEE_MODEL_ID not set']);
+  echo json_encode(['error'=>'MINDEE_API_KEY or MINDEE_MODEL_ID not set']);
   exit;
 }
 
-// --- Mindee SDK
+// Mindee SDK
 require __DIR__ . '/vendor/autoload.php';
 use Mindee\ClientV2;
 use Mindee\Input\PathInput;
@@ -58,169 +56,160 @@ function toISO($s){
   if (!$s) return null; $s = trim((string)$s);
   if (preg_match('/^\d{4}-\d{1,2}-\d{1,2}$/', $s)) return $s;
   if (preg_match('/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})$/', $s, $m)){
-    $y = (int)$m[3]; if ($y < 100) $y += 2000;
-    return sprintf('%04d-%02d-%02d', $y, $m[2], $m[1]);
+    $y=(int)$m[3]; if($y<100)$y+=2000;
+    return sprintf('%04d-%02d-%02d',$y,$m[2],$m[1]);
   }
   return null;
 }
 function flattenAssoc(array $a, string $prefix=''): array {
-  $out = [];
-  foreach ($a as $k => $v) {
-    $path = $prefix === '' ? (string)$k : $prefix . '.' . $k;
-    if (is_array($v)) $out += flattenAssoc($v, $path);
+  $out=[]; foreach ($a as $k=>$v){
+    $path = $prefix===''?(string)$k:$prefix.'.'.$k;
+    if (is_array($v)) $out += flattenAssoc($v,$path);
     else $out[$path] = $v;
-  }
-  return $out;
+  } return $out;
 }
 function uniqueKeepOrder(array $arr){
-  $seen = []; $out = [];
-  foreach($arr as $x){
-    $k = md5((string)$x);
-    if (isset($seen[$k])) continue;
-    $seen[$k] = 1; $out[] = $x;
-  }
+  $seen=[]; $out=[];
+  foreach($arr as $x){ $k=md5((string)$x); if(isset($seen[$k])) continue; $seen[$k]=1; $out[]=$x; }
   return $out;
 }
-// renvoie le texte d'un node Mindee possible
 function firstText($v){
-  if (is_array($v)) { $v0 = $v[0] ?? null; if (is_array($v0)) return $v0['content'] ?? $v0['text'] ?? $v0['value'] ?? null; return $v0; }
-  if (is_object($v)) return $v->content ?? $v->text ?? $v->value ?? null;
+  if (is_array($v)) { $v0=$v[0]??null; if (is_array($v0)) return $v0['content']??$v0['text']??$v0['value']??null; return $v0; }
+  if (is_object($v)) return $v->content??$v->text??$v->value??null;
   return $v;
 }
-// détecte "ça ressemble à un nom de fichier"
 function isFilenameLike(string $s): bool {
-  $s = trim($s);
-  if ($s === '') return false;
-  // extensions fréquentes ou présence de slash
-  if (preg_match('/\.(jpg|jpeg|png|pdf|tif|tiff)$/i', $s)) return true;
-  if (preg_match('#[\\\\/]+#', $s)) return true;
-  // patterns classiques d'appareil photo
-  if (preg_match('/^(img|pXL|dsc|rcpt|scan)[_\-]?\d+/i', $s)) return true;
-  // trop numérique / id technique
-  if (preg_match('/^[a-z0-9_\-]+\.(?:tmp|dat)$/i', $s)) return true;
+  $s=trim($s); if($s==='') return false;
+  if (preg_match('/\.(jpg|jpeg|png|pdf|tif|tiff)$/i',$s)) return true;
+  if (preg_match('#[\\\\/]+#',$s)) return true;
+  if (preg_match('/^(img|pXL|dsc|rcpt|scan)[_\-]?\d+/i',$s)) return true;
+  if (preg_match('/^[a-z0-9_\-]+\.(?:tmp|dat)$/i',$s)) return true;
   return false;
 }
-// pick premier texte non vide qui n'est pas un filename
 function pickSupplierFromList(array $cands): ?string {
-  foreach ($cands as $c) {
-    $t = trim((string)$c);
-    if ($t !== '' && mb_strlen($t) >= 2 && !preg_match('/^\d+$/', $t) && !isFilenameLike($t)) {
-      return $t;
-    }
+  foreach ($cands as $c){
+    $t=trim((string)$c);
+    if ($t!=='' && mb_strlen($t)>=2 && !preg_match('/^\d+$/',$t) && !isFilenameLike($t)) return $t;
   }
   return null;
+}
+
+/* --- catégorisation / scoring des montants --- */
+function classifyContext(string $path, string $ctx): array {
+  $p=strtolower($path); $c=strtolower($ctx); $pc=$p.$c;
+  $reserve = preg_match('/reservat|reserva|pre.?aut|pre.?autor|preauth|pre.?authorization|cauci[oó]n|dep[oó]sito|bloqueo|reservation/', $pc);
+  $supply  = preg_match('/suminist|suministro|combustible|fuel/', $pc);
+  $toPay   = preg_match('/a\s*pagar|à\s*payer|importe\s+total|total\s*cb|total\s*ttc|ttc\b|paid|payment|to\s*pay|net\s*(?:to|à)?\s*payer/', $pc);
+  $generic = preg_match('/total|amount|sum|grand|ttc|pay/', $p);
+  return ['reserve'=>(bool)$reserve,'supply'=>(bool)$supply,'toPay'=>(bool)$toPay,'generic'=>(bool)$generic];
+}
+function scoreAmountCandidate(float $n, string $path, string $ctx): int {
+  $f=classifyContext($path,$ctx); $s=0;
+  if ($f['supply'])  $s+=8;
+  if ($f['toPay'])   $s+=6;
+  if ($f['generic']) $s+=1;
+  if ($f['reserve']) $s-=10;
+  return $s;
+}
+function pickBestTotal(array $cands): ?float {
+  if (empty($cands)) return null;
+
+  $prefSupply = array_filter($cands, fn($a)=>!$a['reserve'] && $a['supply']);
+  $prefPay    = array_filter($cands, fn($a)=>!$a['reserve'] && $a['toPay']);
+  $nonReserve = array_filter($cands, fn($a)=>!$a['reserve']);
+
+  $cmp=function($a,$b){
+    if ($a['score']!==$b['score']) return $b['score']<=>$a['score'];
+    $a00 = fmod($a['num'],1.0)===0.0; $b00 = fmod($b['num'],1.0)===0.0;
+    if ($a00!==$b00) return $a00<=>$b00; // on préfère 67,68 à 99,00
+    return $b['num']<=>$a['num'];
+  };
+
+  if (!empty($prefSupply)) { usort($prefSupply,$cmp); return $prefSupply[0]['num']; }
+  if (!empty($prefPay))    { usort($prefPay,$cmp);    return $prefPay[0]['num']; }
+  if (!empty($nonReserve)) { usort($nonReserve,$cmp); return $nonReserve[0]['num']; }
+
+  usort($cands,$cmp); return $cands[0]['num'];
 }
 
 /* ======================
    Main
 ====================== */
 try {
-  // 1) Écrire l’image base64 dans un fichier temporaire (compat maximale)
+  // 1) Écrit l’image en temporaire
   $tmp    = tempnam(sys_get_temp_dir(), 'rcpt_');
   $tmpJpg = $tmp . '.jpg';
   file_put_contents($tmpJpg, base64_decode($body['imageBase64']));
 
-  // 2) Client Mindee v2 + paramètres (modelId obligatoire)
+  // 2) Mindee
   $client = new ClientV2($apiKey);
   $params = new InferenceParameters($modelId);
+  $input  = new PathInput($tmpJpg);
+  $response = $client->enqueueAndGetInference($input, $params);
 
-  // 3) Input via PathInput (évite les soucis de versions de SDK)
-  $input     = new PathInput($tmpJpg);
-  $response  = $client->enqueueAndGetInference($input, $params);
+  @unlink($tmpJpg); @unlink($tmp);
 
-  // (facultatif) pour diagnostiquer la forme exacte de la réponse :
-  // error_log("MINDEE RAW: " . print_r($response, true));
-
-  // Nettoyage des temporaires
-  @unlink($tmpJpg);
-  @unlink($tmp);
-
-  // 4) Extraction robuste des champs à partir de la réponse
+  // 3) Parsing
   $arr  = json_decode(json_encode($response), true);
   $flat = flattenAssoc($arr);
 
-  // ----- SUPPLIER (priorité aux champs "propres") -----
+  // Supplier
   $pred = $arr['inference']['prediction'] ?? ($arr['document']['inference']['prediction'] ?? null);
-
-  $supplierCandidates = [];
+  $supplierCandidates=[];
   if (is_array($pred)) {
-    $supplierCandidates[] = firstText($pred['supplier_name'] ?? null);
-    $supplierCandidates[] = firstText($pred['merchant_name'] ?? null);
-    $supplierCandidates[] = firstText($pred['company_name'] ?? null);
-    $supplierCandidates[] = firstText($pred['store_name'] ?? null);
-    $supplierCandidates[] = firstText($pred['retailer_name'] ?? null);
-    $supplierCandidates[] = firstText($pred['supplier'] ?? null);
-    $supplierCandidates[] = firstText($pred['merchant'] ?? null);
-    $supplierCandidates = array_filter($supplierCandidates, fn($x) => $x !== null && $x !== '');
-  }
-
-  // si rien via prediction, scanner le flatten mais en évitant les filename
-  if (empty($supplierCandidates)) {
-    foreach ($flat as $path => $val) {
-      if ($val === null || $val === '') continue;
-      if (!preg_match('/supplier|merchant|store|vendor|company|retailer|name/i', $path)) continue;
-      if (is_string($val) && !isFilenameLike($val)) $supplierCandidates[] = $val;
+    foreach (['supplier_name','merchant_name','company_name','store_name','retailer_name','supplier','merchant'] as $k) {
+      $v = firstText($pred[$k] ?? null);
+      if ($v!==null && $v!=='') $supplierCandidates[] = $v;
     }
   }
-
+  if (empty($supplierCandidates)) {
+    foreach ($flat as $path=>$val){
+      if ($val===null || $val==='') continue;
+      if (!preg_match('/supplier|merchant|store|vendor|company|retailer|name/i',$path)) continue;
+      if (is_string($val) && !isFilenameLike($val)) $supplierCandidates[]=$val;
+    }
+  }
   $supplier = pickSupplierFromList($supplierCandidates) ?? '';
 
-  // ----- DATES & TOTAL (heuristique comme avant) -----
-  $dates   = [];
-  $amounts = [];
+  // Dates + Totaux (catégorisé)
+  $dates=[]; $amountCands=[];
+  foreach ($flat as $path=>$val) {
+    if ($val===null || $val==='') continue;
 
-  foreach ($flat as $path => $val) {
-    if ($val === null || $val === '') continue;
-
-    // dates
     if (is_string($val)) {
-      if (preg_match('/\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})\b/', $val, $m)) {
-        $dates[] = $m[1];
+      if (preg_match('/\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})\b/',$val,$m)) $dates[]=$m[1];
+      if (preg_match_all('/(\d[\d\s]{0,3}(?:\s?\d{3})*[.,]\d{2})\b/', $val, $mm)) {
+        foreach ($mm[1] as $found){
+          $n=toNum($found);
+          if ($n!==null && $n>0.2 && $n<20000){
+            $flags = classifyContext((string)$path,(string)$val);
+            $amountCands[]=[
+              'num'=>$n,'path'=>(string)$path,'ctx'=>(string)$val,
+              'score'=>scoreAmountCandidate($n,(string)$path,(string)$val)
+            ] + $flags;
+          }
+        }
       }
-    }
-
-    // montants (string)
-    if (is_string($val)) {
-      if (preg_match('/(\d[\d\s]{0,3}(?:\s?\d{3})*[.,]\d{2})\b/', $val, $m)) {
-        $n = toNum($m[1]);
-        if ($n !== null && $n > 0) $amounts[] = $n;
-      }
-    }
-    // montants numériques sous clés total/amount/sum…
-    elseif (is_numeric($val)) {
-      if (preg_match('/total|amount|sum|grand/i', $path)) {
-        $n = toNum($val);
-        if ($n !== null && $n > 0) $amounts[] = $n;
+    } elseif (is_numeric($val) && preg_match('/total|amount|sum|grand/i',$path)) {
+      $n=toNum($val);
+      if ($n!==null && $n>0.2 && $n<20000){
+        $flags = classifyContext((string)$path,(string)$val);
+        $amountCands[]=[
+          'num'=>$n,'path'=>(string)$path,'ctx'=>(string)$val,
+          'score'=>scoreAmountCandidate($n,(string)$path,(string)$val)
+        ] + $flags;
       }
     }
   }
+  $dates = uniqueKeepOrder($dates);
+  $dateISO=null; foreach ($dates as $d){ $dt=toISO($d); if ($dt){ $dateISO=$dt; break; } }
 
-  $dates   = uniqueKeepOrder($dates);
-  $amounts = uniqueKeepOrder($amounts);
+  $total = pickBestTotal($amountCands);
 
-  $dateISO = null;
-  foreach ($dates as $d) { $dt = toISO($d); if ($dt) { $dateISO = $dt; break; } }
-
-  $total = null;
-  if (!empty($amounts)) {
-    $plausible = array_values(array_filter($amounts, fn($x) => $x > 0.2 && $x < 20000));
-    if (!empty($plausible)) $total = max($plausible);
-  }
-
-  // (fallback directs possibles si ton modèle expose des clés “propres”)
-  // $supplier = $supplier ?: firstText($pred['supplier_name'] ?? $pred['merchant_name'] ?? $pred['company_name'] ?? null);
-  // $dateISO  = $dateISO  ?: toISO(firstText($pred['date'] ?? $pred['purchase_date'] ?? null));
-  // $total    = $total    ?: toNum(firstText($pred['total_amount'] ?? $pred['amount_total'] ?? null));
-
-  echo json_encode([
-    'supplier' => $supplier,
-    'dateISO'  => $dateISO,
-    'total'    => $total,
-  ]);
-  exit;
+  echo json_encode(['supplier'=>$supplier,'dateISO'=>$dateISO,'total'=>$total]); exit;
 
 } catch (\Throwable $e) {
   http_response_code(502);
-  echo json_encode(['error' => 'SDK error', 'message' => $e->getMessage()]);
+  echo json_encode(['error'=>'SDK error','message'=>$e->getMessage()]);
   exit;
 }
