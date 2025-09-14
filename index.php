@@ -99,12 +99,12 @@ function classifyContext(string $path, string $ctx): array {
   $p=strtolower($path); $c=strtolower($ctx); $pc=$p.' '.$c;
 
   $reserve = preg_match('/reservat|reserva|pre.?aut|pre.?autor|preauth|pre.?authorization|cauci[oó]n|dep[oó]sito|bloqueo|reservation/', $pc);
-  $supply  = preg_match('/suminist|suministro|combustible|fuel/', $pc);  // “Total suminist.”
+  $supply  = preg_match('/suminist|suministro|combustible|fuel/', $pc);
   $toPay   = preg_match('/a\s*pagar|à\s*payer|importe\s+total|total\s*cb|total\s*ttc|paid|payment|to\s*pay|net\s*(?:to|à)?\s*payer/', $pc);
   $generic = preg_match('/\btotal\b|\bamount\b|\bsum\b|\bgrand\b|ttc|pay/i', $pc);
 
-  $base    = preg_match('/b\.?\s*imp|base\s*imp|base\s+imponible|subtotal|neto|base[^a-z]?$/i', $pc); // 64,77
-  $vat     = preg_match('/\b(iva|igi|tva|vat|tax|impuesto|impuestos)\b/i', $pc);                      // 2,91
+  $base    = preg_match('/b\.?\s*imp|base\s*imp|base\s+imponible|subtotal|neto|base[^a-z]?$/i', $pc);
+  $vat     = preg_match('/\b(iva|igi|tva|vat|tax|impuesto|impuestos)\b/i', $pc);
   $currency= preg_match('/(?:€|\bEUR\b)/i', $pc);
 
   return [
@@ -119,19 +119,18 @@ function classifyContext(string $path, string $ctx): array {
 }
 function scoreAmountCandidate(float $n, string $path, string $ctx): int {
   $f=classifyContext($path,$ctx); $s=0;
-  if ($f['supply'])   $s+=10;               // “Total suminist.” → très probable
-  if ($f['toPay'])    $s+=8;                // “À payer / A pagar / Total CB…”
-  if ($f['currency']) $s+=3;                // “EUR / €” présent
+  if ($f['supply'])   $s+=10;
+  if ($f['toPay'])    $s+=8;
+  if ($f['currency']) $s+=3;
   if ($f['generic'])  $s+=1;
-  if ($f['base'])     $s-=6;                // B. Imp / Base imponible
-  if ($f['vat'])      $s-=6;                // IGI / IVA / TAX
-  if ($f['reserve'])  $s-=12;               // réservations du terminal
+  if ($f['base'])     $s-=6;
+  if ($f['vat'])      $s-=6;
+  if ($f['reserve'])  $s-=12;
   return $s;
 }
 function pickBestTotal(array $cands): ?float {
   if (empty($cands)) return null;
 
-  // Bonus si “base + VAT ≈ candidat”
   $bases = array_filter($cands, fn($a)=>$a['base'] && !$a['reserve']);
   $vats  = array_filter($cands, fn($a)=>$a['vat']  && !$a['reserve']);
   foreach ($cands as &$c) {
@@ -143,7 +142,6 @@ function pickBestTotal(array $cands): ?float {
     }
   } unset($c);
 
-  // Préférences par groupes
   $prefSupply = array_filter($cands, fn($a)=>!$a['reserve'] && $a['supply']);
   $prefPay    = array_filter($cands, fn($a)=>!$a['reserve'] && $a['toPay']);
   $nonReserve = array_filter($cands, fn($a)=>!$a['reserve']);
@@ -151,7 +149,7 @@ function pickBestTotal(array $cands): ?float {
   $cmp=function($a,$b){
     if ($a['score']!==$b['score']) return $b['score']<=>$a['score'];
     $a00 = fmod($a['num'],1.0)===0.0; $b00 = fmod($b['num'],1.0)===0.0;
-    if ($a00!==$b00) return $a00<=>$b00;      // 67,68 > 99,00
+    if ($a00!==$b00) return $a00<=>$b00;      // 67,68 > 99,00 si égalité de score
     return $b['num']<=>$a['num'];
   };
 
@@ -183,8 +181,13 @@ try {
   $arr  = json_decode(json_encode($response), true);
   $flat = flattenAssoc($arr);
 
-  // Supplier
-  $pred = $arr['inference']['prediction'] ?? ($arr['document']['inference']['prediction'] ?? null);
+  // Prediction bloc (v2)
+  $pred = $arr['document']['inference']['prediction']
+       ?? $arr['inference']['prediction']
+       ?? null;
+
+  // ---------- supplier ----------
+  $supplier = '';
   $supplierCandidates=[];
   if (is_array($pred)) {
     foreach (['supplier_name','merchant_name','company_name','store_name','retailer_name','supplier','merchant'] as $k) {
@@ -201,41 +204,76 @@ try {
   }
   $supplier = pickSupplierFromList($supplierCandidates) ?? '';
 
-  // Dates + Totaux (catégorisé)
-  $dates=[]; $amountCands=[];
-  foreach ($flat as $path=>$val) {
-    if ($val===null || $val==='') continue;
-
-    if (is_string($val)) {
+  // ---------- date (structurée d'abord) ----------
+  $dateISO = null;
+  if (is_array($pred)) {
+    $dateISO = toISO(firstText($pred['date'] ?? $pred['purchase_date'] ?? null));
+  }
+  if (!$dateISO) {
+    $dates=[];
+    foreach ($flat as $path=>$val){
+      if (!is_string($val)) continue;
       if (preg_match('/\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})\b/',$val,$m)) $dates[]=$m[1];
+    }
+    $dates = uniqueKeepOrder($dates);
+    foreach ($dates as $d){ $dt=toISO($d); if($dt){ $dateISO=$dt; break; } }
+  }
 
-      if (preg_match_all('/(\d[\d\s]{0,3}(?:\s?\d{3})*[.,]\d{2})\b/', $val, $mm)) {
-        foreach ($mm[1] as $found){
-          $n=toNum($found);
-          if ($n!==null && $n>0.2 && $n<20000){
-            $flags = classifyContext((string)$path,(string)$val);
-            $amountCands[]=[
-              'num'=>$n, 'path'=>(string)$path, 'ctx'=>(string)$val,
-              'score'=>scoreAmountCandidate($n,(string)$path,(string)$val)
-            ] + $flags;
-          }
-        }
-      }
-    } elseif (is_numeric($val) && preg_match('/total|amount|sum|grand/i',$path)) {
-      $n=toNum($val);
-      if ($n!==null && $n>0.2 && $n<20000){
-        $flags = classifyContext((string)$path,(string)$val);
-        $amountCands[]=[
-          'num'=>$n,'path'=>(string)$path,'ctx'=>(string)$val,
-          'score'=>scoreAmountCandidate($n,(string)$path,(string)$val)
-        ] + $flags;
-      }
+  // ---------- total (structuré d'abord) ----------
+  $total = null;
+  if (is_array($pred)) {
+    // liste large de clés possibles selon modèles / versions
+    $totalKeys = [
+      'total_amount','amount_total','total_incl','total_ttc','total','total_amount_value'
+    ];
+    foreach ($totalKeys as $k) {
+      if (!isset($pred[$k])) continue;
+      $tv = toNum(firstText($pred[$k]));
+      if ($tv !== null && $tv>0.2 && $tv<20000) { $total = $tv; break; }
+    }
+    // si pas de total, mais net+tax présents → somme
+    if ($total === null) {
+      $netKeys = ['total_net','total_excl','amount_net','net_amount'];
+      $taxKeys = ['total_tax','tax_amount','vat_amount','igi_amount','iva_amount'];
+      $net=null; $tax=null;
+      foreach ($netKeys as $k){ if(isset($pred[$k])){ $net=toNum(firstText($pred[$k])); if($net!==null) break; } }
+      foreach ($taxKeys as $k){ if(isset($pred[$k])){ $tax=toNum(firstText($pred[$k])); if($tax!==null) break; } }
+      if ($net!==null && $tax!==null) $total = round($net+$tax,2);
     }
   }
-  $dates = uniqueKeepOrder($dates);
-  $dateISO=null; foreach ($dates as $d){ $dt=toISO($d); if ($dt){ $dateISO=$dt; break; } }
 
-  $total = pickBestTotal($amountCands);
+  // ---------- fallback heuristique si pas de total structuré ----------
+  if ($total === null) {
+    $amountCands=[];
+    foreach ($flat as $path=>$val) {
+      if ($val===null || $val==='') continue;
+
+      if (is_string($val)) {
+        if (preg_match_all('/(\d[\d\s]{0,3}(?:\s?\d{3})*[.,]\d{2})\b/', $val, $mm)) {
+          foreach ($mm[1] as $found){
+            $n=toNum($found);
+            if ($n!==null && $n>0.2 && $n<20000){
+              $flags = classifyContext((string)$path,(string)$val);
+              $amountCands[]=[
+                'num'=>$n, 'path'=>(string)$path, 'ctx'=>(string)$val,
+                'score'=>scoreAmountCandidate($n,(string)$path,(string)$val)
+              ] + $flags;
+            }
+          }
+        }
+      } elseif (is_numeric($val) && preg_match('/total|amount|sum|grand/i',$path)) {
+        $n=toNum($val);
+        if ($n!==null && $n>0.2 && $n<20000){
+          $flags = classifyContext((string)$path,(string)$val);
+          $amountCands[]=[
+            'num'=>$n,'path'=>(string)$path,'ctx'=>(string)$val,
+            'score'=>scoreAmountCandidate($n,(string)$path,(string)$val)
+          ] + $flags;
+        }
+      }
+    }
+    $total = pickBestTotal($amountCands);
+  }
 
   echo json_encode(['supplier'=>$supplier,'dateISO'=>$dateISO,'total'=>$total]); exit;
 
