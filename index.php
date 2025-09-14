@@ -71,6 +71,7 @@ try {
 
   // 4) Lancer l'inférence
   $response = $client->enqueueAndGetInference($input, $params);
+  error_log("MINDEE RAW: " . print_r($response, true));
 
   // (nettoyage fichier temp)
   @unlink($tmpJpg);
