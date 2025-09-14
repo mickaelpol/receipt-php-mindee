@@ -1,4 +1,12 @@
 <?php
+
+if (function_exists('ini_set')) {
+  ini_set('display_errors', '0');     // ne pas afficher les erreurs à l’écran
+  ini_set('log_errors', '1');         // logguer dans les logs Render
+}
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE & ~E_WARNING); // masque les deprecated/warnings
+header('Content-Type: application/json'); // garantit une réponse JSON
+
 // API: POST { imageBase64 } -> { supplier, dateISO, total }  (CORS on)
 
 header('Access-Control-Allow-Origin: *');
