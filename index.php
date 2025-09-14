@@ -94,26 +94,56 @@ function pickSupplierFromList(array $cands): ?string {
   return null;
 }
 
-/* --- catégorisation / scoring des montants --- */
+/** --------- TOTAL logic: classify & score with “base+tax≈total” bonus ---------- */
 function classifyContext(string $path, string $ctx): array {
-  $p=strtolower($path); $c=strtolower($ctx); $pc=$p.$c;
+  $p=strtolower($path); $c=strtolower($ctx); $pc=$p.' '.$c;
+
   $reserve = preg_match('/reservat|reserva|pre.?aut|pre.?autor|preauth|pre.?authorization|cauci[oó]n|dep[oó]sito|bloqueo|reservation/', $pc);
-  $supply  = preg_match('/suminist|suministro|combustible|fuel/', $pc);
-  $toPay   = preg_match('/a\s*pagar|à\s*payer|importe\s+total|total\s*cb|total\s*ttc|ttc\b|paid|payment|to\s*pay|net\s*(?:to|à)?\s*payer/', $pc);
-  $generic = preg_match('/total|amount|sum|grand|ttc|pay/', $p);
-  return ['reserve'=>(bool)$reserve,'supply'=>(bool)$supply,'toPay'=>(bool)$toPay,'generic'=>(bool)$generic];
+  $supply  = preg_match('/suminist|suministro|combustible|fuel/', $pc);  // “Total suminist.”
+  $toPay   = preg_match('/a\s*pagar|à\s*payer|importe\s+total|total\s*cb|total\s*ttc|paid|payment|to\s*pay|net\s*(?:to|à)?\s*payer/', $pc);
+  $generic = preg_match('/\btotal\b|\bamount\b|\bsum\b|\bgrand\b|ttc|pay/i', $pc);
+
+  $base    = preg_match('/b\.?\s*imp|base\s*imp|base\s+imponible|subtotal|neto|base[^a-z]?$/i', $pc); // 64,77
+  $vat     = preg_match('/\b(iva|igi|tva|vat|tax|impuesto|impuestos)\b/i', $pc);                      // 2,91
+  $currency= preg_match('/(?:€|\bEUR\b)/i', $pc);
+
+  return [
+    'reserve'=>(bool)$reserve,
+    'supply'=>(bool)$supply,
+    'toPay'=>(bool)$toPay,
+    'generic'=>(bool)$generic,
+    'base'=>(bool)$base,
+    'vat'=>(bool)$vat,
+    'currency'=>(bool)$currency,
+  ];
 }
 function scoreAmountCandidate(float $n, string $path, string $ctx): int {
   $f=classifyContext($path,$ctx); $s=0;
-  if ($f['supply'])  $s+=8;
-  if ($f['toPay'])   $s+=6;
-  if ($f['generic']) $s+=1;
-  if ($f['reserve']) $s-=10;
+  if ($f['supply'])   $s+=10;               // “Total suminist.” → très probable
+  if ($f['toPay'])    $s+=8;                // “À payer / A pagar / Total CB…”
+  if ($f['currency']) $s+=3;                // “EUR / €” présent
+  if ($f['generic'])  $s+=1;
+  if ($f['base'])     $s-=6;                // B. Imp / Base imponible
+  if ($f['vat'])      $s-=6;                // IGI / IVA / TAX
+  if ($f['reserve'])  $s-=12;               // réservations du terminal
   return $s;
 }
 function pickBestTotal(array $cands): ?float {
   if (empty($cands)) return null;
 
+  // Bonus si “base + VAT ≈ candidat”
+  $bases = array_filter($cands, fn($a)=>$a['base'] && !$a['reserve']);
+  $vats  = array_filter($cands, fn($a)=>$a['vat']  && !$a['reserve']);
+  foreach ($cands as &$c) {
+    foreach ($bases as $b) {
+      foreach ($vats as $v) {
+        $sum = round($b['num'] + $v['num'], 2);
+        if (abs($sum - $c['num']) <= 0.02) { $c['score'] += 5; break 2; }
+      }
+    }
+  } unset($c);
+
+  // Préférences par groupes
   $prefSupply = array_filter($cands, fn($a)=>!$a['reserve'] && $a['supply']);
   $prefPay    = array_filter($cands, fn($a)=>!$a['reserve'] && $a['toPay']);
   $nonReserve = array_filter($cands, fn($a)=>!$a['reserve']);
@@ -121,7 +151,7 @@ function pickBestTotal(array $cands): ?float {
   $cmp=function($a,$b){
     if ($a['score']!==$b['score']) return $b['score']<=>$a['score'];
     $a00 = fmod($a['num'],1.0)===0.0; $b00 = fmod($b['num'],1.0)===0.0;
-    if ($a00!==$b00) return $a00<=>$b00; // on préfère 67,68 à 99,00
+    if ($a00!==$b00) return $a00<=>$b00;      // 67,68 > 99,00
     return $b['num']<=>$a['num'];
   };
 
@@ -136,7 +166,7 @@ function pickBestTotal(array $cands): ?float {
    Main
 ====================== */
 try {
-  // 1) Écrit l’image en temporaire
+  // 1) Temp file for Mindee
   $tmp    = tempnam(sys_get_temp_dir(), 'rcpt_');
   $tmpJpg = $tmp . '.jpg';
   file_put_contents($tmpJpg, base64_decode($body['imageBase64']));
@@ -178,13 +208,14 @@ try {
 
     if (is_string($val)) {
       if (preg_match('/\b(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4})\b/',$val,$m)) $dates[]=$m[1];
+
       if (preg_match_all('/(\d[\d\s]{0,3}(?:\s?\d{3})*[.,]\d{2})\b/', $val, $mm)) {
         foreach ($mm[1] as $found){
           $n=toNum($found);
           if ($n!==null && $n>0.2 && $n<20000){
             $flags = classifyContext((string)$path,(string)$val);
             $amountCands[]=[
-              'num'=>$n,'path'=>(string)$path,'ctx'=>(string)$val,
+              'num'=>$n, 'path'=>(string)$path, 'ctx'=>(string)$val,
               'score'=>scoreAmountCandidate($n,(string)$path,(string)$val)
             ] + $flags;
           }
