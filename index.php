@@ -33,11 +33,38 @@ require __DIR__ . '/vendor/autoload.php';
 use Mindee\Client;
 use Mindee\Product\Receipt\ReceiptV5;
 
-// Clé API depuis l’environnement
 $apiKey = getenv('MINDEE_API_KEY') ?: '';
-// fallback temporaire : header "X-Api-Key" ou champ POST "api_key"
+
+// Fallback: accepter la clé depuis un header HTTP ou un champ POST
 if ($apiKey === '') {
-    $apiKey = $_SERVER['HTTP_X_API_KEY'] ?? ($_POST['api_key'] ?? '');
+    // 1) Authorization: Token md_xxx
+    $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+    if (stripos($auth, 'Token ') === 0) {
+        $apiKey = trim(substr($auth, 6));
+    }
+}
+
+if ($apiKey === '') {
+    // 2) X-Api-Key: md_xxx  (avec ou sans "Token " devant)
+    $x = $_SERVER['HTTP_X_API_KEY'] ?? '';
+    if ($x !== '') {
+        $apiKey = preg_replace('/^Token\s+/i', '', trim($x));
+    }
+}
+
+if ($apiKey === '') {
+    // 3) Champ multipart/POST api_key=md_xxx  (optionnel)
+    $apiKey = isset($_POST['api_key']) ? preg_replace('/^Token\s+/i', '', trim((string)$_POST['api_key'])) : '';
+}
+
+if ($apiKey === '') {
+    http_response_code(500);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode([
+        'ok' => false,
+        'error' => 'MINDEE_API_KEY manquante. Définis la variable d’environnement ou envoie la clé via Authorization/X-Api-Key/api_key.'
+    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    exit;
 }
 
 // Vérif upload
