@@ -35,13 +35,9 @@ use Mindee\Product\Receipt\ReceiptV5;
 
 // Clé API depuis l’environnement
 $apiKey = getenv('MINDEE_API_KEY') ?: '';
+// fallback temporaire : header "X-Api-Key" ou champ POST "api_key"
 if ($apiKey === '') {
-    http_response_code(500);
-    echo json_encode([
-        'ok' => false,
-        'error' => 'MINDEE_API_KEY manquante (définissez la variable d’environnement).'
-    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-    exit;
+    $apiKey = $_SERVER['HTTP_X_API_KEY'] ?? ($_POST['api_key'] ?? '');
 }
 
 // Vérif upload
