@@ -1,30 +1,22 @@
 <?php
 /**
- * index.php — API JSON pour analyser un ticket de caisse avec Mindee (ReceiptV5)
- *
- * Requête attendue (exemple):
- *   curl -X POST http://localhost/index.php \
- *     -H "Accept: application/json" \
- *     -F "document=@/chemin/vers/ticket.jpg"
- *
- * Réponse: JSON
+ * index.php — API JSON pour analyser un ticket (Expense Receipt) avec le SDK PHP Mindee.
+ * - Dépendances : composer require mindee/mindee
+ * - Auth conseillée : variable d'env MINDEE_API_KEY=md_xxx
+ * - Fallbacks acceptés (facultatifs) : 
+ *      Authorization: Token md_xxx   |   X-Api-Key: md_xxx   |   champ POST api_key=md_xxx
+ * - Requête attendue : POST multipart avec champ fichier "document"
  */
 
 declare(strict_types=1);
 
-// --- Réglages d'erreur (on journalise, on n'affiche pas en prod)
 error_reporting(E_ALL);
 ini_set('display_errors', '0');
-
 header('Content-Type: application/json; charset=utf-8');
 
-// Refuse tout sauf POST
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
     http_response_code(405);
-    echo json_encode([
-        'ok' => false,
-        'error' => 'Méthode non autorisée. Utilisez POST avec un fichier "document".'
-    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    echo json_encode(['ok' => false, 'error' => 'Méthode non autorisée. Utilisez POST avec un fichier "document".'], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
     exit;
 }
 
@@ -33,84 +25,63 @@ require __DIR__ . '/vendor/autoload.php';
 use Mindee\Client;
 use Mindee\Product\Receipt\ReceiptV5;
 
+/** 1) Récupération de la clé API */
 $apiKey = getenv('MINDEE_API_KEY') ?: '';
-
-// Fallback: accepter la clé depuis un header HTTP ou un champ POST
 if ($apiKey === '') {
-    // 1) Authorization: Token md_xxx
+    // Fallback 1: Authorization: Token md_xxx
     $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
     if (stripos($auth, 'Token ') === 0) {
         $apiKey = trim(substr($auth, 6));
     }
 }
-
 if ($apiKey === '') {
-    // 2) X-Api-Key: md_xxx  (avec ou sans "Token " devant)
+    // Fallback 2: X-Api-Key: md_xxx  (accepte avec ou sans "Token ")
     $x = $_SERVER['HTTP_X_API_KEY'] ?? '';
     if ($x !== '') {
         $apiKey = preg_replace('/^Token\s+/i', '', trim($x));
     }
 }
-
 if ($apiKey === '') {
-    // 3) Champ multipart/POST api_key=md_xxx  (optionnel)
+    // Fallback 3: champ POST api_key
     $apiKey = isset($_POST['api_key']) ? preg_replace('/^Token\s+/i', '', trim((string)$_POST['api_key'])) : '';
 }
-
 if ($apiKey === '') {
     http_response_code(500);
-    header('Content-Type: application/json; charset=utf-8');
-    echo json_encode([
-        'ok' => false,
-        'error' => 'MINDEE_API_KEY manquante. Définis la variable d’environnement ou envoie la clé via Authorization/X-Api-Key/api_key.'
-    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    echo json_encode(['ok' => false, 'error' => 'Clé API manquante. Définis MINDEE_API_KEY ou envoie Authorization/X-Api-Key/api_key.'], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
     exit;
 }
 
-// Vérif upload
-if (!isset($_FILES['document']) || !is_array($_FILES['document']) || ($_FILES['document']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+/** 2) Vérification fichier */
+if (!isset($_FILES['document']) || ($_FILES['document']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
     http_response_code(400);
-    echo json_encode([
-        'ok' => false,
-        'error' => 'Aucun fichier "document" reçu ou erreur d’upload.'
-    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    echo json_encode(['ok' => false, 'error' => 'Aucun fichier "document" reçu ou erreur d’upload.'], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
     exit;
 }
 
-// Stockage temporaire
+/** 3) Stocker temporairement */
 $srcTmp  = $_FILES['document']['tmp_name'];
 $ext     = pathinfo($_FILES['document']['name'] ?? '', PATHINFO_EXTENSION);
 $dstPath = sys_get_temp_dir() . DIRECTORY_SEPARATOR . ('mindee_receipt_' . bin2hex(random_bytes(6)) . ($ext ? ('.' . $ext) : ''));
-
-// move_uploaded_file peut échouer selon la conf; tentez copy() en secours
 if (!@move_uploaded_file($srcTmp, $dstPath)) {
     if (!@copy($srcTmp, $dstPath)) {
         http_response_code(500);
-        echo json_encode([
-            'ok' => false,
-            'error' => 'Impossible de stocker temporairement le fichier.'
-        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+        echo json_encode(['ok' => false, 'error' => 'Impossible de stocker temporairement le fichier.'], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
         exit;
     }
 }
 
 try {
-    // Client Mindee
-    $client = new Client($apiKey);
-
-    // Source depuis le fichier local
+    /** 4) Appel SDK Mindee — ReceiptV5 (produit Expense Receipts) */
+    $client      = new Client($apiKey);
     $inputSource = $client->sourceFromPath($dstPath);
-
-    // Lancement de la prédiction sur le modèle Receipt V5 (tickets de caisse)
     $apiResponse = $client->parse(ReceiptV5::class, $inputSource);
 
-    // Raccourcis
-    $doc        = $apiResponse->document ?? null;
-    $inference  = $doc?->inference ?? null;
-    $product    = $inference?->product ?? null;
-    $pred       = $inference?->prediction ?? null;
+    $doc       = $apiResponse->document ?? null;
+    $inference = $doc?->inference ?? null;
+    $product   = $inference?->product ?? null;
+    $pred      = $inference?->prediction ?? null;
 
-    // Normalisation "taxes"
+    // Normalisation taxes
     $taxes = [];
     if (is_iterable($pred?->taxes ?? null)) {
         foreach ($pred->taxes as $t) {
@@ -123,7 +94,7 @@ try {
         }
     }
 
-    // Normalisation "line_items"
+    // Normalisation lignes
     $lineItems = [];
     if (is_iterable($pred?->lineItems ?? null)) {
         foreach ($pred->lineItems as $li) {
@@ -136,7 +107,7 @@ try {
         }
     }
 
-    // Normalisation "registrations" fournisseur
+    // Immatriculations fournisseur
     $regs = [];
     if (is_iterable($pred?->supplierCompanyRegistrations ?? null)) {
         foreach ($pred->supplierCompanyRegistrations as $r) {
@@ -147,37 +118,36 @@ try {
     $payload = [
         'ok' => true,
         'mindee' => [
-            'product'   => $product->name    ?? 'expense_receipts',
-            'version'   => $product->version ?? 'v5',
-            'document_id' => $doc->id        ?? null,
-            'filename'  => $doc->name        ?? basename($dstPath),
+            'product'     => $product->name    ?? 'expense_receipts',
+            'version'     => $product->version ?? 'v5',
+            'document_id' => $doc->id          ?? null,
+            'filename'    => $doc->name        ?? basename($dstPath),
         ],
         'receipt' => [
             'category'        => $pred?->category?->value        ?? null,
             'subcategory'     => $pred?->subcategory?->value     ?? null,
             'document_type'   => $pred?->documentType?->value    ?? null,
             'locale'          => $pred?->locale?->value          ?? null,
-            'date'            => $pred?->date?->value            ?? null, // "YYYY-MM-DD"
-            'time'            => $pred?->time?->value            ?? null, // "HH:MM"
+            'date'            => $pred?->date?->value            ?? null,
+            'time'            => $pred?->time?->value            ?? null,
             'total_amount'    => $pred?->totalAmount?->value     ?? null,
             'total_net'       => $pred?->totalNet?->value        ?? null,
             'total_tax'       => $pred?->totalTax?->value        ?? null,
             'tip'             => $pred?->tip?->value             ?? null,
             'receipt_number'  => $pred?->receiptNumber?->value   ?? null,
             'supplier' => [
-                'name'           => $pred?->supplierName?->value         ?? null,
-                'address'        => $pred?->supplierAddress?->value      ?? null,
-                'phone'          => $pred?->supplierPhoneNumber?->value  ?? null,
-                'registrations'  => $regs,
+                'name'          => $pred?->supplierName?->value        ?? null,
+                'address'       => $pred?->supplierAddress?->value     ?? null,
+                'phone'         => $pred?->supplierPhoneNumber?->value ?? null,
+                'registrations' => $regs,
             ],
             'taxes'      => $taxes,
             'line_items' => $lineItems,
         ],
     ];
 
-    // Optionnel: inclure le rendu texte Mindee si APP_DEBUG=1 (pratique pour debug)
     if ((string)getenv('APP_DEBUG') === '1') {
-        $payload['debug_rst'] = (string)$doc;
+        $payload['debug_rst'] = (string)$doc; // rendu texte complet du SDK (pratique pour debug)
     }
 
     echo json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
@@ -190,8 +160,5 @@ try {
         'message' => $e->getMessage(),
     ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
 } finally {
-    // Nettoyage
-    if (is_file($dstPath)) {
-        @unlink($dstPath);
-    }
+    if (is_file($dstPath)) { @unlink($dstPath); }
 }
