@@ -14,4 +14,4 @@ use Mindee\Input\InferenceParameters;
 // getenv('MINDEE_MODEL_ID') 
 
 $mindeeClient = new Client(getenv('MINDEE_API_KEY'));
-return json_encode($mindeeClient);
+return json_encode(['test' => 'ok']);
