@@ -1,199 +1,201 @@
 <?php
+declare(strict_types=1);
+
 /**
- * index.php — API JSON Mindee (Expense Receipts) avec diagnostics de clé.
- * Dépendance : composer require mindee/mindee
+ * Backend Mindee V2 sans SDK — spécial front GitHub Pages
+ * Reçoit : POST JSON { imageBase64 }  OU  multipart "document"
+ * Renvoie : { ok, supplier, dateISO, total }
+ *
+ * ENV (Render) :
+ *   MINDEE_API_KEY   = md_xxx            (clé brute, sans "Token"/"Bearer")
+ *   MODEL_ID         = uuid du modèle
+ *   ALLOWED_ORIGINS  = https://<user>.github.io[,https://autre-domaine.tld]
  */
 
-declare(strict_types=1);
-error_reporting(E_ALL);
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED);
 ini_set('display_errors', '0');
+
+/* ---------- CORS ---------- */
+$origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+$allowed = getenv('ALLOWED_ORIGINS') ?: '*';
+$allow = '*';
+if ($allowed !== '*') {
+    $list = array_map('trim', explode(',', $allowed));
+    if ($origin && in_array($origin, $list, true)) $allow = $origin;
+    else $allow = $list[0] ?? '*';
+}
+header('Access-Control-Allow-Origin: '.$allow);
+header('Vary: Origin');
+header('Access-Control-Allow-Methods: POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Access-Control-Max-Age: 86400');
+
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') { http_response_code(204); exit; }
+
 header('Content-Type: application/json; charset=utf-8');
+
+/* ---------- ENV ---------- */
+$API_KEY  = getenv('MINDEE_API_KEY') ?: '';
+$MODEL_ID = getenv('MODEL_ID') ?: '';
+
+if ($API_KEY === '' || $MODEL_ID === '') {
+    http_response_code(500);
+    echo json_encode(['ok'=>false,'error'=>'MINDEE_API_KEY ou MODEL_ID manquant.']);
+    exit;
+}
+
+/* ---------- HTTP helper ---------- */
+function http_req(string $method, string $url, array $headers = [], $body = null, bool $multipart = false): array {
+    $ch = curl_init($url);
+    $hdrs = [];
+    foreach ($headers as $k => $v) $hdrs[] = $k . ': ' . $v;
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST  => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER         => true,
+        CURLOPT_HTTPHEADER     => $hdrs,
+        CURLOPT_TIMEOUT        => 60,
+        CURLOPT_FOLLOWLOCATION => false,
+    ]);
+    if ($method !== 'GET') {
+        if ($multipart && is_array($body)) curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+        else curl_setopt($ch, CURLOPT_POSTFIELDS, (string)$body);
+    }
+    $resp = curl_exec($ch);
+    if ($resp === false) { $err = curl_error($ch); curl_close($ch); return ['status'=>0,'headers'=>[], 'body'=>null,'error'=>$err]; }
+    $status   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $hdr_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+
+    $raw_headers = substr($resp, 0, $hdr_size);
+    $body_str    = substr($resp, $hdr_size);
+    $headers_out = [];
+    foreach (explode("\r\n", $raw_headers) as $line) {
+        if (strpos($line, ':') !== false) { [$k, $v] = explode(':', $line, 2); $headers_out[strtolower(trim($k))] = trim($v); }
+    }
+    return ['status'=>$status, 'headers'=>$headers_out, 'body'=>$body_str, 'error'=>null];
+}
+
+/* ---------- récupérer l'image (JSON base64 OU multipart) ---------- */
+function save_base64_to_tmp(string $b64, string $ext='.jpg'): string {
+    $raw = preg_replace('#^data:[^;]+;base64,#', '', $b64);
+    $bin = base64_decode($raw, true);
+    if ($bin === false) throw new RuntimeException('Base64 invalide');
+    $path = sys_get_temp_dir().'/mindee_'.bin2hex(random_bytes(6)).$ext;
+    file_put_contents($path, $bin);
+    return $path;
+}
 
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
     http_response_code(405);
-    echo json_encode(['ok' => false, 'error' => 'Méthode non autorisée. Utilisez POST avec un fichier "document".'], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
+    echo json_encode(['ok'=>false,'error'=>'Utilisez POST avec JSON {imageBase64} ou multipart "document".']);
     exit;
 }
 
-require __DIR__ . '/vendor/autoload.php';
-
-use Mindee\Client;
-use Mindee\Product\Receipt\ReceiptV5;
-
-/** Helpers **/
-function mask_key(?string $k): string {
-    if (!$k) return '';
-    $k = (string)$k;
-    $len = strlen($k);
-    if ($len <= 10) return substr($k, 0, 2) . str_repeat('*', max(0, $len-4)) . substr($k, -2);
-    return substr($k, 0, 4) . str_repeat('*', $len - 8) . substr($k, -4);
-}
-function clean_key(?string $k): string {
-    $k = (string)$k;
-    // supprime "Token " au début, espaces/retours, guillemets exotiques
-    $k = preg_replace('/^\s*Token\s+/i', '', $k);
-    $k = str_replace(["\r", "\n", "\t", '’', '“', '”'], '', $k);
-    return trim($k);
-}
-
-/** 1) Récupération de la clé API (env + fallbacks) **/
-$apiKeySource = 'env';
-$apiKey = getenv('MINDEE_API_KEY') ?: '';
-
-if ($apiKey === '') {
-    $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
-    if ($auth) {
-        $apiKey = $auth;
-        $apiKeySource = 'Authorization header';
-    }
-}
-if ($apiKey === '') {
-    $x = $_SERVER['HTTP_X_API_KEY'] ?? '';
-    if ($x) {
-        $apiKey = $x;
-        $apiKeySource = 'X-Api-Key header';
-    }
-}
-if ($apiKey === '') {
-    $postKey = $_POST['api_key'] ?? '';
-    if ($postKey) {
-        $apiKey = $postKey;
-        $apiKeySource = 'POST field api_key';
-    }
-}
-$apiKey = clean_key($apiKey);
-
-if ($apiKey === '') {
-    http_response_code(500);
-    echo json_encode([
-        'ok' => false,
-        'error' => 'Clé API manquante. Définis MINDEE_API_KEY ou envoie Authorization: Token md_xxx / X-Api-Key: md_xxx / api_key=md_xxx.'
-    ], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
-    exit;
-}
-
-/** 1.b) Validation rapide du format de clé **/
-$formatOk = (bool)preg_match('/^md_[A-Za-z0-9]+$/', $apiKey);
-if (!$formatOk) {
-    http_response_code(401);
-    echo json_encode([
-        'ok' => false,
-        'error' => 'Format de clé invalide. Elle doit commencer par "md_..." (sans "Token ").',
-        'diagnostic' => [
-            'source' => $apiKeySource,
-            'key_masked' => mask_key($apiKey),
-            'hint' => 'Envoie la clé brute (md_...), sans préfixe "Token " et sans espaces/retours.'
-        ]
-    ], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
-    exit;
-}
-
-/** 2) Vérification du fichier **/
-if (!isset($_FILES['document']) || ($_FILES['document']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
-    http_response_code(400);
-    echo json_encode(['ok' => false, 'error' => 'Aucun fichier "document" reçu ou erreur d’upload.'], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
-    exit;
-}
-
-/** 3) Stockage temporaire **/
-$srcTmp  = $_FILES['document']['tmp_name'];
-$ext     = pathinfo($_FILES['document']['name'] ?? '', PATHINFO_EXTENSION);
-$dstPath = sys_get_temp_dir() . DIRECTORY_SEPARATOR . ('mindee_receipt_' . bin2hex(random_bytes(6)) . ($ext ? ('.' . $ext) : ''));
-if (!@move_uploaded_file($srcTmp, $dstPath)) {
-    if (!@copy($srcTmp, $dstPath)) {
-        http_response_code(500);
-        echo json_encode(['ok' => false, 'error' => 'Impossible de stocker temporairement le fichier.'], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
-        exit;
-    }
-}
+$tmpPath = null;
+$ct = $_SERVER['CONTENT_TYPE'] ?? $_SERVER['HTTP_CONTENT_TYPE'] ?? '';
 
 try {
-    /** 4) Appel SDK Mindee — ReceiptV5 */
-    $client      = new Client($apiKey);
-    $inputSource = $client->sourceFromPath($dstPath);
-    $apiResponse = $client->parse(ReceiptV5::class, $inputSource);
-
-    $doc       = $apiResponse->document ?? null;
-    $inference = $doc?->inference ?? null;
-    $product   = $inference?->product ?? null;
-    $pred      = $inference?->prediction ?? null;
-
-    // Taxes
-    $taxes = [];
-    if (is_iterable($pred?->taxes ?? null)) {
-        foreach ($pred->taxes as $t) {
-            $taxes[] = [
-                'base'   => $t->base?->value   ?? null,
-                'code'   => $t->code?->value   ?? null,
-                'rate'   => $t->rate?->value   ?? null,
-                'amount' => $t->amount?->value ?? null,
-            ];
-        }
-    }
-    // Lignes
-    $lineItems = [];
-    if (is_iterable($pred?->lineItems ?? null)) {
-        foreach ($pred->lineItems as $li) {
-            $lineItems[] = [
-                'description'  => $li->description   ?? null,
-                'quantity'     => $li->quantity      ?? null,
-                'unit_price'   => $li->unitPrice     ?? null,
-                'total_amount' => $li->totalAmount   ?? null,
-            ];
-        }
-    }
-    // Immatriculations
-    $regs = [];
-    if (is_iterable($pred?->supplierCompanyRegistrations ?? null)) {
-        foreach ($pred->supplierCompanyRegistrations as $r) {
-            $regs[] = $r->value ?? null;
-        }
+    if (stripos($ct, 'application/json') !== false) {
+        $raw  = file_get_contents('php://input') ?: '';
+        $json = json_decode($raw, true);
+        $b64  = $json['imageBase64'] ?? '';
+        if (!$b64) throw new RuntimeException('Champ "imageBase64" manquant dans le JSON.');
+        // si possible, essaie de déduire l’extension
+        $ext = '.jpg';
+        if (preg_match('#^data:image/(\w+)#', $b64, $m)) $ext='.'.strtolower($m[1]);
+        $tmpPath = save_base64_to_tmp($b64, $ext);
+    } elseif (!empty($_FILES['document']) && $_FILES['document']['error'] === UPLOAD_ERR_OK) {
+        $tmp = $_FILES['document']['tmp_name'];
+        $ext = pathinfo($_FILES['document']['name'] ?? '', PATHINFO_EXTENSION);
+        $dst = sys_get_temp_dir().'/mindee_'.bin2hex(random_bytes(6)).($ext?".$ext":'');
+        @move_uploaded_file($tmp, $dst) || @copy($tmp, $dst);
+        $tmpPath = $dst;
+    } else {
+        throw new RuntimeException('Aucun "imageBase64" ni fichier "document" reçu.');
     }
 
-    $payload = [
-        'ok' => true,
-        'diagnostic' => [
-            'key_source' => $apiKeySource,
-            'key_masked' => mask_key($apiKey),
-        ],
-        'mindee' => [
-            'product'     => $product->name    ?? 'expense_receipts',
-            'version'     => $product->version ?? 'v5',
-            'document_id' => $doc->id          ?? null,
-            'filename'    => $doc->name        ?? basename($dstPath),
-        ],
-        'receipt' => [
-            'category'        => $pred?->category?->value        ?? null,
-            'subcategory'     => $pred?->subcategory?->value     ?? null,
-            'document_type'   => $pred?->documentType?->value    ?? null,
-            'locale'          => $pred?->locale?->value          ?? null,
-            'date'            => $pred?->date?->value            ?? null,
-            'time'            => $pred?->time?->value            ?? null,
-            'total_amount'    => $pred?->totalAmount?->value     ?? null,
-            'total_net'       => $pred?->totalNet?->value        ?? null,
-            'total_tax'       => $pred?->totalTax?->value        ?? null,
-            'tip'             => $pred?->tip?->value             ?? null,
-            'receipt_number'  => $pred?->receiptNumber?->value   ?? null,
-            'supplier' => [
-                'name'          => $pred?->supplierName?->value        ?? null,
-                'address'       => $pred?->supplierAddress?->value     ?? null,
-                'phone'         => $pred?->supplierPhoneNumber?->value ?? null,
-                'registrations' => $regs,
-            ],
-            'taxes'      => $taxes,
-            'line_items' => $lineItems,
-        ],
-    ];
+    /* ---------- 1) ENQUEUE ---------- */
+    $enqueueUrl = 'https://api-v2.mindee.net/v2/inferences/enqueue';
+    $mime = @mime_content_type($tmpPath) ?: 'application/octet-stream';
+    $curlFile = new CURLFile($tmpPath, $mime, basename($tmpPath));
+    $enqHeaders = ['Authorization'=>$API_KEY, 'Accept'=>'application/json'];
+    $enqBody = ['model_id'=>$MODEL_ID, 'file'=>$curlFile];
 
-    echo json_encode($payload, JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
+    $enq = http_req('POST', $enqueueUrl, $enqHeaders, $enqBody, true);
+    if ($enq['status'] < 200 || $enq['status'] >= 300) {
+        http_response_code(502);
+        echo json_encode(['ok'=>false,'step'=>'enqueue','status'=>$enq['status'],'body'=>$enq['body']]);
+        exit;
+    }
+    $enqJson = json_decode($enq['body'], true);
+    $job     = $enqJson['job'] ?? null;
+    if (!$job) { http_response_code(502); echo json_encode(['ok'=>false,'step'=>'enqueue','error'=>'job manquant']); exit; }
 
-} catch (\Throwable $e) {
-    http_response_code(500);
+    $pollingUrl = $job['polling_url'] ?? ($job['id'] ? "https://api-v2.mindee.net/v2/jobs/{$job['id']}" : null);
+    $resultUrl  = $job['result_url'] ?? null;
+
+    /* ---------- 2) POLL JOB ---------- */
+    $pollHeaders = ['Authorization'=>$API_KEY, 'Accept'=>'application/json'];
+    $max = 60; $delay = 1;
+    for ($i=0; $i<$max && !$resultUrl; $i++) {
+        $poll = http_req('GET', $pollingUrl, $pollHeaders, null, false);
+        if ($poll['status'] === 302) {
+            $loc = $poll['headers']['location'] ?? '';
+            if ($loc) { $resultUrl = $loc; break; }
+        }
+        $pj = json_decode($poll['body'] ?? '', true);
+        $st = $pj['job']['status'] ?? '';
+        if ($st === 'Processed') { $resultUrl = $pj['job']['result_url'] ?? $resultUrl; break; }
+        if ($st === 'Failed') { http_response_code(502); echo json_encode(['ok'=>false,'step'=>'poll','status'=>'Failed','job'=>$pj['job']]); exit; }
+        sleep($delay);
+    }
+    if (!$resultUrl) { http_response_code(504); echo json_encode(['ok'=>false,'step'=>'poll','error'=>'timeout']); exit; }
+
+    /* ---------- 3) GET INFERENCE ---------- */
+    $infHeaders = ['Authorization'=>$API_KEY, 'Accept'=>'application/json'];
+    $inf = http_req('GET', $resultUrl, $infHeaders, null, false);
+    if ($inf['status'] < 200 || $inf['status'] >= 300) {
+        http_response_code(502);
+        echo json_encode(['ok'=>false,'step'=>'inference','status'=>$inf['status'],'body'=>$inf['body']]);
+        exit;
+    }
+    $infJson   = json_decode($inf['body'], true);
+    $inference = $infJson['inference'] ?? $infJson;
+    $fields    = $inference['result']['fields'] ?? [];
+
+    // --- extraction robuste des 3 champs (snake/camel, avec .value) ---
+    $supplier = null; $dateISO = null; $total = null;
+
+    $supplier = $fields['supplier_name']['value'] ?? $fields['supplierName']['value'] ?? null;
+    $dateISO  = $fields['date']['value']          ?? $fields['Date']['value']         ?? null;
+
+    // possible variantes: total_amount / totalAmount / total_price / totalPrice
+    $totalRaw = $fields['total_amount']['value']  ?? $fields['totalAmount']['value']
+        ?? $fields['total_price']['value']   ?? $fields['totalPrice']['value']   ?? null;
+
+    // Si total absent, tentative fallback: total_net + total_tax
+    if ($totalRaw === null) {
+        $net = $fields['total_net']['value'] ?? $fields['totalNet']['value'] ?? null;
+        $tax = $fields['total_tax']['value'] ?? $fields['totalTax']['value'] ?? null;
+        if (is_numeric($net) && is_numeric($tax)) $totalRaw = (float)$net + (float)$tax;
+    }
+
+    // Normalisation
+    if (is_string($totalRaw)) $totalRaw = str_replace(',', '.', $totalRaw);
+    $total = is_numeric($totalRaw) ? (float)$totalRaw : null;
+
+    // Réponse minimaliste pour le front
     echo json_encode([
-        'ok'      => false,
-        'error'   => 'Erreur lors de l’analyse Mindee.',
-        'message' => $e->getMessage(),
-    ], JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE);
+        'ok'       => true,
+        'supplier' => $supplier,           // string | null
+        'dateISO'  => $dateISO,            // "YYYY-MM-DD" | null
+        'total'    => $total               // float | null (pas d’arrondi ici)
+    ], JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION);
+
+} catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(['ok'=>false,'error'=>$e->getMessage()]);
 } finally {
-    if (is_file($dstPath)) { @unlink($dstPath); }
+    if (isset($tmpPath) && $tmpPath && is_file($tmpPath)) @unlink($tmpPath);
 }

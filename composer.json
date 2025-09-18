@@ -2,6 +2,9 @@
   "name": "mp/receipt-php-mindee",
   "type": "project",
   "require": {
-    "mindee/mindee": "^2.0"
-  }
+    "mindee/mindee": ">=2.0",
+    "ext-curl": "*"
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true
 }
