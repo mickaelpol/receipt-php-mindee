@@ -7,18 +7,20 @@ declare(strict_types=1);
  * Renvoie : { ok, supplier, dateISO, total }
  *
  * ENV (Render) :
- *   MINDEE_API_KEY   = md_xxx            (clé brute, sans "Token"/"Bearer")
- *   MODEL_ID         = uuid du modèle
- *   ALLOWED_ORIGINS  = https://<user>.github.io[,https://autre-domaine.tld]
+ *   MINDEE_API_KEY         = md_xxx            (clé brute, sans "Token"/"Bearer")
+ *   MODEL_ID               = uuid du modèle
+ *   ALLOWED_ORIGINS        = https://<user>.github.io[,https://autre-domaine.tld]
+ *   PUBLIC_RECEIPT_API_URL = https://receipt-php-mindee.onrender.com/index.php
+ *   (optionnel) PUBLIC_BASE_URL = https://receipt-php-mindee.onrender.com
  */
 
 error_reporting(E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED);
 ini_set('display_errors', '0');
 
 /* ---------- CORS ---------- */
-$origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+$origin  = $_SERVER['HTTP_ORIGIN'] ?? '';
 $allowed = getenv('ALLOWED_ORIGINS') ?: '*';
-$allow = '*';
+$allow   = '*';
 if ($allowed !== '*') {
     $list = array_map('trim', explode(',', $allowed));
     if ($origin && in_array($origin, $list, true)) $allow = $origin;
@@ -26,11 +28,45 @@ if ($allowed !== '*') {
 }
 header('Access-Control-Allow-Origin: '.$allow);
 header('Vary: Origin');
-header('Access-Control-Allow-Methods: POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization');
+header('Access-Control-Allow-Methods: GET, POST, OPTIONS'); // <-- ajoute GET
+header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Google-Access-Token');
 header('Access-Control-Max-Age: 86400');
 
-if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') { http_response_code(204); exit; }
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$uri    = $_SERVER['REQUEST_URI'] ?? '/';
+
+// Préflight
+if ($method === 'OPTIONS') { http_response_code(204); exit; }
+
+/* ---------- ENDPOINT CONFIG (GET) ----------
+   Renvoie l'URL publique de l'API (depuis PUBLIC_RECEIPT_API_URL si dispo)
+   Répond à :
+   - /index.php?config=1
+   - /config  ou /config.php (si ton router pointe sur index.php)
+------------------------------------------------ */
+if ($method === 'GET' && (isset($_GET['config']) || preg_match('~/config(\.php)?($|\?)~', $uri))) {
+    header('Content-Type: application/json; charset=utf-8');
+
+    // 1) On privilégie la variable d'env fournie
+    $apiUrl = getenv('PUBLIC_RECEIPT_API_URL');
+
+    // 2) Fallback auto si jamais absente
+    if (!$apiUrl) {
+        $forwardProto = $_SERVER['HTTP_X_FORWARDED_PROTO'] ?? null;
+        $httpsOn      = !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
+        $scheme = $forwardProto ?: ($httpsOn ? 'https' : 'http');
+        $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        $baseUrl = getenv('PUBLIC_BASE_URL') ?: ($scheme.'://'.$host);
+        $apiUrl  = rtrim($baseUrl, '/').'/index.php';
+    }
+
+    echo json_encode([
+        'ok'              => true,
+        'receipt_api_url' => $apiUrl,
+        'ts'              => time(),
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -86,7 +122,8 @@ function save_base64_to_tmp(string $b64, string $ext='.jpg'): string {
     return $path;
 }
 
-if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+// Refuser tout sauf POST pour l'analyse
+if ($method !== 'POST') {
     http_response_code(405);
     echo json_encode(['ok'=>false,'error'=>'Utilisez POST avec JSON {imageBase64} ou multipart "document".']);
     exit;
@@ -165,8 +202,6 @@ try {
     $fields    = $inference['result']['fields'] ?? [];
 
     // --- extraction robuste des 3 champs (snake/camel, avec .value) ---
-    $supplier = null; $dateISO = null; $total = null;
-
     $supplier = $fields['supplier_name']['value'] ?? $fields['supplierName']['value'] ?? null;
     $dateISO  = $fields['date']['value']          ?? $fields['Date']['value']         ?? null;
 
